@@ -12,6 +12,7 @@ class AbandonedCart extends Model
 
     protected $casts = [
         'items' => 'array',
+        'metadata' => 'array',
         'subtotal' => 'decimal:2',
         'last_activity_at' => 'immutable_datetime',
         'abandoned_at' => 'immutable_datetime',
