@@ -5,9 +5,9 @@ namespace ItmoSoft\AbandonedCarts;
 use Carbon\CarbonInterface;
 use Illuminate\Database\Eloquent\Builder;
 use Illuminate\Support\Facades\DB;
-use Illuminate\Support\Str;
 use InvalidArgumentException;
 use ItmoSoft\AbandonedCarts\Models\AbandonedCart;
+use LogicException;
 
 class AbandonedCartManager
 {
@@ -15,10 +15,6 @@ class AbandonedCartManager
     {
     }
 
-    /**
-     * Create or refresh a cart snapshot. Pass a stable cart_key from the host app.
-     * Items should be serializable snapshots, not live Eloquent models.
-     */
     public function capture(
         string $cartKey,
         array $items,
@@ -31,42 +27,46 @@ class AbandonedCartManager
         if (trim($cartKey) === '') {
             throw new InvalidArgumentException('A non-empty cart key is required.');
         }
-        if ((float) $subtotal < 0) {
-            throw new InvalidArgumentException('Cart subtotal cannot be negative.');
+        if (! is_numeric($subtotal) || (float) $subtotal < 0) {
+            throw new InvalidArgumentException('Cart subtotal must be a non-negative number.');
         }
 
-        $cart = AbandonedCart::query()->firstOrNew(['cart_key' => $cartKey]);
-        $cart->items = $items;
-        $cart->subtotal = $subtotal;
-        $cart->currency = $currency;
-        $cart->metadata = $metadata;
-        $cart->last_activity_at = now();
-        $cart->abandoned_at = null;
-        $cart->recovered_at = null;
-        $cart->converted_at = null;
-        $cart->expires_at = $expiresAt;
+        return DB::transaction(function () use ($cartKey, $items, $subtotal, $customer, $currency, $expiresAt, $metadata): AbandonedCart {
+            $cart = AbandonedCart::query()->where('cart_key', $cartKey)->lockForUpdate()->first();
+            if ($cart?->converted_at !== null) {
+                throw new LogicException('A converted cart is terminal and cannot be captured again.');
+            }
+            $cart ??= new AbandonedCart(['cart_key' => $cartKey]);
 
-        if ($customer !== null) {
-            $cart->customer()->associate($customer);
-        }
+            $cart->items = $items;
+            $cart->subtotal = $subtotal;
+            $cart->currency = $currency;
+            $cart->metadata = $metadata;
+            $cart->last_activity_at = now();
+            $cart->abandoned_at = null;
+            // A newly active cart can become abandoned again; conversion remains terminal.
+            $cart->recovered_at = null;
+            $cart->expires_at = $expiresAt;
 
-        $cart->save();
+            if ($customer !== null) {
+                $cart->customer()->associate($customer);
+            }
 
-        return $cart->refresh();
+            $cart->save();
+            return $cart->refresh();
+        });
     }
 
-    /**
-     * Mark inactive carts as abandoned. Schedule this method from the host app.
-     */
     public function markAbandoned(?CarbonInterface $cutoff = null): int
     {
         $cutoff ??= now()->subMinutes((int) ($this->config['abandon_after_minutes'] ?? 60));
 
         return AbandonedCart::query()
             ->whereNull('abandoned_at')
+            ->whereNull('recovered_at')
             ->whereNull('converted_at')
             ->where('last_activity_at', '<=', $cutoff)
-            ->where(function (Builder $query) {
+            ->where(function (Builder $query): void {
                 $query->whereNull('expires_at')->orWhere('expires_at', '>', now());
             })
             ->update(['abandoned_at' => now(), 'updated_at' => now()]);
@@ -79,47 +79,61 @@ class AbandonedCartManager
         }
 
         return AbandonedCart::query()
-            ->where('recovery_token', hash_equals($token, $token) ? $token : '')
+            ->where('recovery_token', $token)
             ->whereNull('converted_at')
+            ->where(function (Builder $query): void {
+                $query->whereNull('expires_at')->orWhere('expires_at', '>', now());
+            })
             ->first();
     }
 
     public function markRecovered(AbandonedCart $cart): AbandonedCart
     {
-        if ($cart->converted_at !== null) {
-            throw new InvalidArgumentException('A converted cart cannot be marked as recovered.');
-        }
+        return DB::transaction(function () use ($cart): AbandonedCart {
+            $locked = AbandonedCart::query()->lockForUpdate()->findOrFail($cart->getKey());
+            if ($locked->converted_at !== null) {
+                throw new LogicException('A converted cart cannot be marked as recovered.');
+            }
+            if ($locked->expires_at !== null && $locked->expires_at->isPast()) {
+                throw new LogicException('An expired cart cannot be recovered.');
+            }
 
-        $cart->forceFill([
-            'recovered_at' => now(),
-            'abandoned_at' => null,
-        ])->save();
+            if ($locked->recovered_at === null) {
+                $locked->forceFill(['recovered_at' => now(), 'abandoned_at' => null])->save();
+            }
 
-        return $cart->refresh();
+            return $locked->refresh();
+        });
     }
 
     public function markConverted(AbandonedCart $cart, ?string $orderReference = null): AbandonedCart
     {
-        $cart->forceFill([
-            'converted_at' => now(),
-            'order_reference' => $orderReference,
-            'recovered_at' => $cart->recovered_at ?? now(),
-        ])->save();
+        return DB::transaction(function () use ($cart, $orderReference): AbandonedCart {
+            $locked = AbandonedCart::query()->lockForUpdate()->findOrFail($cart->getKey());
+            if ($locked->converted_at === null) {
+                $locked->forceFill([
+                    'converted_at' => now(),
+                    'order_reference' => $orderReference,
+                    'recovered_at' => $locked->recovered_at ?? now(),
+                    'abandoned_at' => null,
+                ])->save();
+            } elseif ($orderReference !== null && $locked->order_reference !== $orderReference) {
+                throw new LogicException('A converted cart cannot be linked to a different order.');
+            }
 
-        return $cart->refresh();
+            return $locked->refresh();
+        });
     }
 
     public function abandoned(?CarbonInterface $from = null, ?CarbonInterface $to = null): Builder
     {
         $query = AbandonedCart::query()->abandoned();
-
         if ($from !== null) {
             $query->where('abandoned_at', '>=', $from);
         }
         if ($to !== null) {
             $query->where('abandoned_at', '<=', $to);
         }
-
         return $query;
     }
 }
